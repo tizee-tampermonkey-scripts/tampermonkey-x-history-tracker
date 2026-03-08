@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X History Tracker
 // @namespace    https://github.com/tizee-tampermonkey-scripts/tampermonkey-x-history-tracker
-// @version      1.1.0
+// @version      1.2.0
 // @description  Automatically tracks visited X/Twitter posts with frecency-based scoring for easy retrieval. Stores URL + title in localStorage with a configurable cap.
 // @author       tizee
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=x.com
@@ -237,6 +237,38 @@
     };
 
     window.addEventListener('popstate', () => trackCurrentPage());
+
+    // --- MutationObserver on <head> for og:title changes ---
+    // X's internal navigation may update the URL and meta tags without
+    // calling pushState/replaceState. Watch for og:title attribute/subtree
+    // mutations to catch these navigations.
+    const headObserver = new MutationObserver(() => {
+        const url = window.location.href;
+        if (!STATUS_URL_REGEX.test(url)) return;
+        const match = STATUS_URL_REGEX.exec(url);
+        const normalizedUrl = `https://x.com/${match[1]}/status/${match[2]}`;
+        if (normalizedUrl === lastTrackedUrl) {
+            // Same URL, but meta may have updated with real content — check title
+            const title = extractTitle();
+            if (isMeaningfulTitle(title)) {
+                const existing = visitHistory.get(normalizedUrl);
+                if (existing && existing.title === normalizedUrl) {
+                    // Title was a fallback URL, now we have real content
+                    existing.title = title;
+                    saveHistory(visitHistory);
+                    console.debug(`[X History Tracker] Updated title: ${normalizedUrl} (${title})`);
+                }
+            }
+            return;
+        }
+        trackCurrentPage();
+    });
+    headObserver.observe(document.head, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['content'],
+    });
 
     // Initial track on page load
     trackCurrentPage();
