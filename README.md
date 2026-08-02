@@ -43,7 +43,7 @@ Opens a panel with two tabs:
 - Export button to download as JSON
 
 **Settings tab**
-- **Max entries** -- Slider (50-2000) or manual input (10-5000). Lowest-frecency entries are evicted when exceeded (the post you just visited is never evicted).
+- **Max entries** -- Slider (50-5000) or manual input (10-5000). Lowest-frecency entries are evicted when exceeded (the post you just visited is never evicted).
 - **Frecency half-life** -- Slider (1-30 days). Lower values make recent visits dominate. Higher values let older entries persist.
 - **Danger Zone** -- Clear all history with two-step confirmation.
 

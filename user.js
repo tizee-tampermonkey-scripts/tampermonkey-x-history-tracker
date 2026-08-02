@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X History Tracker
 // @namespace    https://github.com/tizee-tampermonkey-scripts/tampermonkey-x-history-tracker
-// @version      1.3.0
+// @version      1.3.1
 // @description  Automatically tracks visited X/Twitter posts with frecency-based scoring for easy retrieval. Stores URL + title in localStorage with a configurable cap.
 // @author       tizee
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=x.com
@@ -32,6 +32,8 @@
     };
     // Previous default, used to migrate saved settings that were never customized
     const LEGACY_DEFAULT_MAX_ENTRIES = 200;
+    // Hard limit for maxEntries, shared by the settings slider/input
+    const MAX_ENTRIES_LIMIT = 5000;
 
     function loadSettings() {
         const saved = GM_getValue(SETTINGS_KEY);
@@ -942,7 +944,7 @@
                 e.url.toLowerCase().includes(query)
             );
             renderEntries(filtered);
-            stats.textContent = `${filtered.length} of ${entries.length} posts | sorted by frecency`;
+            stats.textContent = `${filtered.length} of ${entries.length} / ${settings.maxEntries} posts | sorted by frecency`;
         });
 
         historyContent.appendChild(searchContainer);
@@ -978,7 +980,7 @@
         maxRange.type = 'range';
         maxRange.className = 'xht-setting-range';
         maxRange.min = '50';
-        maxRange.max = '2000';
+        maxRange.max = String(MAX_ENTRIES_LIMIT);
         maxRange.step = '50';
         maxRange.value = draft.maxEntries;
 
@@ -986,7 +988,7 @@
         maxInput.type = 'number';
         maxInput.className = 'xht-setting-input';
         maxInput.min = '10';
-        maxInput.max = '5000';
+        maxInput.max = String(MAX_ENTRIES_LIMIT);
         maxInput.value = draft.maxEntries;
 
         maxRange.addEventListener('input', () => {
@@ -997,7 +999,7 @@
         maxInput.addEventListener('change', () => {
             let val = parseInt(maxInput.value, 10);
             if (isNaN(val) || val < 10) val = 10;
-            if (val > 5000) val = 5000;
+            if (val > MAX_ENTRIES_LIMIT) val = MAX_ENTRIES_LIMIT;
             draft.maxEntries = val;
             maxInput.value = val;
             // Clamp range slider to its own max
