@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X History Tracker
 // @namespace    https://github.com/tizee-tampermonkey-scripts/tampermonkey-x-history-tracker
-// @version      1.2.0
+// @version      1.3.0
 // @description  Automatically tracks visited X/Twitter posts with frecency-based scoring for easy retrieval. Stores URL + title in localStorage with a configurable cap.
 // @author       tizee
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=x.com
@@ -27,15 +27,22 @@
 
     // --- Settings ---
     const DEFAULT_SETTINGS = {
-        maxEntries: 200,
+        maxEntries: 2000,
         halfLifeDays: 7,
     };
+    // Previous default, used to migrate saved settings that were never customized
+    const LEGACY_DEFAULT_MAX_ENTRIES = 200;
 
     function loadSettings() {
         const saved = GM_getValue(SETTINGS_KEY);
         if (!saved) return { ...DEFAULT_SETTINGS };
         try {
-            return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+            const parsed = JSON.parse(saved);
+            // Migrate: user never changed the old default, so follow the new one
+            if (parsed.maxEntries === LEGACY_DEFAULT_MAX_ENTRIES) {
+                parsed.maxEntries = DEFAULT_SETTINGS.maxEntries;
+            }
+            return { ...DEFAULT_SETTINGS, ...parsed };
         } catch {
             return { ...DEFAULT_SETTINGS };
         }
@@ -52,26 +59,67 @@
     }
 
     // --- Frecency Scoring ---
-    // Inspired by z/autojump: score = frequency * recency_weight
-    // recency_weight = 2^(-age / half_life), so recent visits contribute more
+    // z/autojump-style: each visit credits +1 point, and accumulated points
+    // decay exponentially with age: score(now) = score * 2^(-age / half_life).
+    // Recently visited posts rank highest; idle scores fade over time.
 
     /**
-     * Calculate frecency score for an entry.
-     * @param {object} entry - { url, title, visits, lastVisit }
+     * Score of an entry at a given time (decayed since its last visit).
+     * @param {object} entry - { url, title, score, lastVisit }
      * @param {number} now - Current timestamp
-     * @returns {number} Frecency score
+     * @returns {number} Decayed frecency score
      */
     function frecencyScore(entry, now) {
         const age = now - entry.lastVisit;
-        const recency = Math.pow(2, -age / getHalfLifeMs());
-        return entry.visits * recency;
+        return entry.score * Math.pow(2, -age / getHalfLifeMs());
     }
 
     // --- Storage ---
+    // v2 compact format: array of tuples [username, statusId, title, score, lastVisitSec]
+    // - URL is reconstructed on load (saves the repeated "https://x.com/.../status/" prefix)
+    // - title is stored as "" when it's just the URL fallback (restored on load)
+    // - score is rounded to 3 decimals; timestamps are stored in seconds
+    // v1 legacy objects { url, title, visits, lastVisit } are still accepted on load.
+
+    /**
+     * Serialize an entry to its compact tuple form.
+     * @param {object} entry - { url, title, score, lastVisit }
+     * @returns {Array|object}
+     */
+    function serializeEntry(entry) {
+        const match = STATUS_URL_REGEX.exec(entry.url);
+        if (!match) return entry; // defensive: keep legacy form for non-status URLs
+        const title = entry.title === entry.url ? '' : entry.title;
+        const score = Math.round(entry.score * 1000) / 1000;
+        return [match[1], match[2], title, score, Math.floor(entry.lastVisit / 1000)];
+    }
+
+    /**
+     * Deserialize a stored entry (v2 tuple or v1 legacy object) to the
+     * in-memory form. Returns null for malformed data.
+     * @param {Array|object} raw
+     * @returns {object|null} { url, title, score, lastVisit }
+     */
+    function deserializeEntry(raw) {
+        if (Array.isArray(raw)) {
+            const [username, statusId, title, score, lastVisitSec] = raw;
+            if (typeof username !== 'string' || typeof statusId !== 'string' ||
+                typeof score !== 'number' || typeof lastVisitSec !== 'number') {
+                return null;
+            }
+            const url = `https://x.com/${username}/status/${statusId}`;
+            return { url, title: title || url, score, lastVisit: lastVisitSec * 1000 };
+        }
+        // v1 legacy object: credit all past visits at lastVisit as the seed score
+        if (raw && typeof raw.url === 'string' && typeof raw.visits === 'number') {
+            return { url: raw.url, title: raw.title || raw.url, score: raw.visits, lastVisit: raw.lastVisit };
+        }
+        return null;
+    }
 
     /**
      * Load history from localStorage.
-     * @returns {Map<string, object>} url -> { url, title, visits, lastVisit }
+     * @returns {Map<string, object>} url -> { url, title, score, lastVisit }
      */
     function loadHistory() {
         try {
@@ -80,10 +128,9 @@
             const arr = JSON.parse(raw);
             if (!Array.isArray(arr)) return new Map();
             const map = new Map();
-            for (const entry of arr) {
-                if (entry.url && typeof entry.visits === 'number') {
-                    map.set(entry.url, entry);
-                }
+            for (const rawEntry of arr) {
+                const entry = deserializeEntry(rawEntry);
+                if (entry) map.set(entry.url, entry);
             }
             return map;
         } catch (e) {
@@ -95,8 +142,11 @@
     /**
      * Save history to localStorage, evicting lowest-frecency entries if over cap.
      * @param {Map<string, object>} map
+     * @param {string|null} [pinnedUrl] - URL that must survive eviction.
+     *   A freshly recorded visit has the lowest score (1 point), so without
+     *   pinning it would be evicted immediately once the cap is reached.
      */
-    function saveHistory(map) {
+    function saveHistory(map, pinnedUrl = null) {
         const now = Date.now();
         let entries = Array.from(map.values());
 
@@ -104,6 +154,13 @@
         if (entries.length > settings.maxEntries) {
             entries.sort((a, b) => frecencyScore(b, now) - frecencyScore(a, now));
             entries = entries.slice(0, settings.maxEntries);
+            if (pinnedUrl && !entries.some(e => e.url === pinnedUrl)) {
+                const pinned = map.get(pinnedUrl);
+                if (pinned) {
+                    entries.pop();
+                    entries.push(pinned);
+                }
+            }
             // Rebuild map
             map.clear();
             for (const entry of entries) {
@@ -112,7 +169,7 @@
         }
 
         try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(entries.map(serializeEntry)));
         } catch (e) {
             console.error('[X History Tracker] Failed to save history:', e);
         }
@@ -164,7 +221,8 @@
         const existing = visitHistory.get(normalizedUrl);
 
         if (existing) {
-            existing.visits += 1;
+            // Decay the accumulated score to now, then credit this visit
+            existing.score = frecencyScore(existing, now) + 1;
             existing.lastVisit = now;
             if (isMeaningfulTitle(title)) {
                 existing.title = title;
@@ -173,12 +231,12 @@
             visitHistory.set(normalizedUrl, {
                 url: normalizedUrl,
                 title: isMeaningfulTitle(title) ? title : normalizedUrl,
-                visits: 1,
+                score: 1,
                 lastVisit: now,
             });
         }
 
-        saveHistory(visitHistory);
+        saveHistory(visitHistory, normalizedUrl);
         console.debug(`[X History Tracker] Tracked: ${normalizedUrl} (${title})`);
     }
 
@@ -837,14 +895,10 @@
                 const urlMatch = STATUS_URL_REGEX.exec(entry.url);
                 urlEl.textContent = urlMatch ? `@${urlMatch[1]}/status/${urlMatch[2]}` : entry.url;
 
-                const visitsEl = document.createElement('span');
-                visitsEl.textContent = `${entry.visits} visit${entry.visits > 1 ? 's' : ''}`;
-
                 const timeEl = document.createElement('span');
                 timeEl.textContent = timeAgo(entry.lastVisit);
 
                 meta.appendChild(urlEl);
-                meta.appendChild(visitsEl);
                 meta.appendChild(timeEl);
                 content.appendChild(titleEl);
                 content.appendChild(meta);
@@ -924,7 +978,7 @@
         maxRange.type = 'range';
         maxRange.className = 'xht-setting-range';
         maxRange.min = '50';
-        maxRange.max = '1000';
+        maxRange.max = '2000';
         maxRange.step = '50';
         maxRange.value = draft.maxEntries;
 
