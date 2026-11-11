@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X History Tracker
 // @namespace    https://github.com/tizee-tampermonkey-scripts/tampermonkey-x-history-tracker
-// @version      1.3.1
-// @description  Automatically tracks visited X/Twitter posts with frecency-based scoring for easy retrieval. Stores URL + title in localStorage with a configurable cap.
+// @version      1.4.0
+// @description  Automatically tracks visited X/Twitter posts with tweet text and newest-first ordering. Stores URL + text in localStorage with a configurable cap.
 // @author       tizee
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=x.com
 // @downloadURL  https://raw.githubusercontent.com/tizee-tampermonkey-scripts/tampermonkey-x-history-tracker/refs/heads/main/user.js
@@ -28,7 +28,6 @@
     // --- Settings ---
     const DEFAULT_SETTINGS = {
         maxEntries: 2000,
-        halfLifeDays: 7,
     };
     // Previous default, used to migrate saved settings that were never customized
     const LEGACY_DEFAULT_MAX_ENTRIES = 200;
@@ -41,10 +40,10 @@
         try {
             const parsed = JSON.parse(saved);
             // Migrate: user never changed the old default, so follow the new one
-            if (parsed.maxEntries === LEGACY_DEFAULT_MAX_ENTRIES) {
-                parsed.maxEntries = DEFAULT_SETTINGS.maxEntries;
-            }
-            return { ...DEFAULT_SETTINGS, ...parsed };
+            const maxEntries = parsed.maxEntries === LEGACY_DEFAULT_MAX_ENTRIES
+                ? DEFAULT_SETTINGS.maxEntries
+                : parsed.maxEntries;
+            return { maxEntries: maxEntries || DEFAULT_SETTINGS.maxEntries };
         } catch {
             return { ...DEFAULT_SETTINGS };
         }
@@ -56,72 +55,53 @@
 
     let settings = loadSettings();
 
-    function getHalfLifeMs() {
-        return settings.halfLifeDays * 24 * 60 * 60 * 1000;
-    }
-
-    // --- Frecency Scoring ---
-    // z/autojump-style: each visit credits +1 point, and accumulated points
-    // decay exponentially with age: score(now) = score * 2^(-age / half_life).
-    // Recently visited posts rank highest; idle scores fade over time.
-
-    /**
-     * Score of an entry at a given time (decayed since its last visit).
-     * @param {object} entry - { url, title, score, lastVisit }
-     * @param {number} now - Current timestamp
-     * @returns {number} Decayed frecency score
-     */
-    function frecencyScore(entry, now) {
-        const age = now - entry.lastVisit;
-        return entry.score * Math.pow(2, -age / getHalfLifeMs());
-    }
-
     // --- Storage ---
-    // v2 compact format: array of tuples [username, statusId, title, score, lastVisitSec]
+    // v3 compact format: array of tuples [username, statusId, title, lastVisitSec]
     // - URL is reconstructed on load (saves the repeated "https://x.com/.../status/" prefix)
     // - title is stored as "" when it's just the URL fallback (restored on load)
-    // - score is rounded to 3 decimals; timestamps are stored in seconds
+    // v2 legacy tuples [username, statusId, title, score, lastVisitSec]
     // v1 legacy objects { url, title, visits, lastVisit } are still accepted on load.
 
     /**
      * Serialize an entry to its compact tuple form.
-     * @param {object} entry - { url, title, score, lastVisit }
+     * @param {object} entry - { url, title, lastVisit }
      * @returns {Array|object}
      */
     function serializeEntry(entry) {
         const match = STATUS_URL_REGEX.exec(entry.url);
         if (!match) return entry; // defensive: keep legacy form for non-status URLs
         const title = entry.title === entry.url ? '' : entry.title;
-        const score = Math.round(entry.score * 1000) / 1000;
-        return [match[1], match[2], title, score, Math.floor(entry.lastVisit / 1000)];
+        return [match[1], match[2], title, Math.floor(entry.lastVisit / 1000)];
     }
 
     /**
-     * Deserialize a stored entry (v2 tuple or v1 legacy object) to the
+     * Deserialize a stored entry (v3 tuple, v2 tuple, or v1 object) to the
      * in-memory form. Returns null for malformed data.
      * @param {Array|object} raw
-     * @returns {object|null} { url, title, score, lastVisit }
+     * @returns {object|null} { url, title, lastVisit }
      */
     function deserializeEntry(raw) {
         if (Array.isArray(raw)) {
-            const [username, statusId, title, score, lastVisitSec] = raw;
+            // v2 tuples have 5 fields; v3 tuples have 4.
+            const lastVisitSec = raw[raw.length >= 5 ? 4 : 3];
+            const [username, statusId, title] = raw;
             if (typeof username !== 'string' || typeof statusId !== 'string' ||
-                typeof score !== 'number' || typeof lastVisitSec !== 'number') {
+                typeof lastVisitSec !== 'number') {
                 return null;
             }
             const url = `https://x.com/${username}/status/${statusId}`;
-            return { url, title: title || url, score, lastVisit: lastVisitSec * 1000 };
+            return { url, title: title || url, lastVisit: lastVisitSec * 1000 };
         }
-        // v1 legacy object: credit all past visits at lastVisit as the seed score
-        if (raw && typeof raw.url === 'string' && typeof raw.visits === 'number') {
-            return { url: raw.url, title: raw.title || raw.url, score: raw.visits, lastVisit: raw.lastVisit };
+        // v1 legacy object
+        if (raw && typeof raw.url === 'string' && typeof raw.lastVisit === 'number') {
+            return { url: raw.url, title: raw.title || raw.url, lastVisit: raw.lastVisit };
         }
         return null;
     }
 
     /**
      * Load history from localStorage.
-     * @returns {Map<string, object>} url -> { url, title, score, lastVisit }
+     * @returns {Map<string, object>} url -> { url, title, lastVisit }
      */
     function loadHistory() {
         try {
@@ -142,19 +122,18 @@
     }
 
     /**
-     * Save history to localStorage, evicting lowest-frecency entries if over cap.
+     * Save history to localStorage, evicting oldest entries if over cap.
      * @param {Map<string, object>} map
      * @param {string|null} [pinnedUrl] - URL that must survive eviction.
-     *   A freshly recorded visit has the lowest score (1 point), so without
-     *   pinning it would be evicted immediately once the cap is reached.
+     *   The visit that just triggered the save may be older than entries in
+     *   another tab, so pin it explicitly.
      */
     function saveHistory(map, pinnedUrl = null) {
-        const now = Date.now();
         let entries = Array.from(map.values());
 
-        // Evict by lowest frecency score when over cap
+        // Evict by oldest visit when over cap
         if (entries.length > settings.maxEntries) {
-            entries.sort((a, b) => frecencyScore(b, now) - frecencyScore(a, now));
+            entries.sort((a, b) => b.lastVisit - a.lastVisit);
             entries = entries.slice(0, settings.maxEntries);
             if (pinnedUrl && !entries.some(e => e.url === pinnedUrl)) {
                 const pinned = map.get(pinnedUrl);
@@ -178,18 +157,88 @@
     }
 
     // --- Title Extraction ---
+    // X's og:title meta tag is written on full page load and not reliably
+    // updated during SPA navigation. Read the rendered tweet instead.
+
+    const MAX_TITLE_LENGTH = 500;
+    const TWEET_SELECTOR = 'article[data-testid="tweet"]';
+    // Page-translation extensions inject translated copies of each text node.
+    const TRANSLATION_SELECTOR = '[class*="immersive-translate-target"]';
 
     /**
-     * Extract title from og:title meta tag.
-     * Format: "User on X: \"tweet content...\"" or "User on X" (no content yet)
+     * Read visible text from an element, preserving emoji alt text and line breaks.
+     * @param {Element} el
      * @returns {string}
      */
-    function extractTitle() {
-        const ogTitle = document.querySelector('meta[property="og:title"]');
-        if (ogTitle && ogTitle.content) {
-            return ogTitle.content.trim().slice(0, 200);
+    function textOf(el) {
+        let out = '';
+        (function walk(node) {
+            for (const child of node.childNodes) {
+                if (child.nodeType === Node.TEXT_NODE) {
+                    out += child.nodeValue;
+                } else if (child.nodeType === Node.ELEMENT_NODE) {
+                    if (child.matches(TRANSLATION_SELECTOR)) continue;
+                    if (child.tagName === 'IMG') out += child.getAttribute('alt') || '';
+                    else if (child.tagName === 'BR') out += '\n';
+                    else walk(child);
+                }
+            }
+        })(el);
+        return out.trim();
+    }
+
+    /** A quoted post sits in a div[role=link] inside the article. */
+    function inQuote(el, article) {
+        const quote = el.closest('div[role="link"]');
+        return !!quote && article.contains(quote);
+    }
+
+    /** Find the first matching element that belongs to the post itself. */
+    function own(article, selector) {
+        return [...article.querySelectorAll(selector)].find(el => !inQuote(el, article));
+    }
+
+    /**
+     * Find the article for the status page being viewed.
+     * @param {string} statusId
+     * @returns {Element|null}
+     */
+    function findTweetArticle(statusId) {
+        for (const article of document.querySelectorAll(TWEET_SELECTOR)) {
+            const time = own(article, 'a[href*="/status/"] time');
+            if (!time) continue; // ads have no timestamp link
+            const href = time.closest('a')?.getAttribute('href') || '';
+            const match = /^\/([^/?#]+)\/status\/(\d+)/.exec(href);
+            if (match && match[2] === statusId) return article;
         }
-        return '';
+        return null;
+    }
+
+    /**
+     * Build a readable title from the rendered tweet.
+     * @param {string} statusId
+     * @returns {string} e.g. 'Name on X: "tweet text"', or '' if not rendered yet
+     */
+    function extractTweetTitle(statusId) {
+        const article = findTweetArticle(statusId);
+        if (!article) return '';
+
+        const nameBlock = own(article, '[data-testid="User-Name"]');
+        const name = nameBlock
+            ? textOf(nameBlock.firstElementChild || nameBlock).split('\n')[0].trim()
+            : '';
+
+        const textEl = own(article, '[data-testid="tweetText"]');
+        let text = textEl ? textOf(textEl) : '';
+        if (!text) {
+            if (own(article, '[data-testid="tweetPhoto"]')) text = '[image]';
+            else if (own(article, '[data-testid="videoPlayer"]')) text = '[video]';
+            else if (own(article, '[data-testid="card.wrapper"]')) text = '[link]';
+        }
+
+        if (!name && !text) return '';
+        const title = !name ? text : (text ? `${name} on X: "${text}"` : `${name} on X`);
+        return title.slice(0, MAX_TITLE_LENGTH);
     }
 
     // --- Core Tracking ---
@@ -197,9 +246,7 @@
     let lastTrackedUrl = null;
 
     /**
-     * Check if og:title has actual tweet content.
-     * Rejects: empty, "X", or bare "Username on X" (no quoted content).
-     * Accepts: "Username on X: \"tweet content...\"" (has colon + content).
+     * Reject empty, "X", and bare "Username on X" (no tweet content).
      * @param {string} title
      * @returns {boolean}
      */
@@ -207,76 +254,85 @@
         if (!title) return false;
         const stripped = title.trim();
         if (stripped === 'X' || stripped.length <= 1) return false;
-        // og:title with content always has ": " after "on X"
-        // e.g. "Mr Panda on X: \"...\""  vs  "Mr Panda on X" (no content yet)
         if (/on X$/.test(stripped)) return false;
         return true;
     }
 
     /**
-     * Record a visit for the given URL with the given title.
+     * Record a visit for the given URL. The visit is saved immediately with a
+     * URL fallback, so a slow-rendering tweet is never lost.
      * @param {string} normalizedUrl
      * @param {string} title
      */
     function recordVisit(normalizedUrl, title) {
         const now = Date.now();
         const existing = visitHistory.get(normalizedUrl);
+        const meaningful = isMeaningfulTitle(title);
 
         if (existing) {
-            // Decay the accumulated score to now, then credit this visit
-            existing.score = frecencyScore(existing, now) + 1;
             existing.lastVisit = now;
-            if (isMeaningfulTitle(title)) {
-                existing.title = title;
-            }
+            if (meaningful) existing.title = title;
         } else {
             visitHistory.set(normalizedUrl, {
                 url: normalizedUrl,
-                title: isMeaningfulTitle(title) ? title : normalizedUrl,
-                score: 1,
+                title: meaningful ? title : normalizedUrl,
                 lastVisit: now,
             });
         }
 
         saveHistory(visitHistory, normalizedUrl);
-        console.debug(`[X History Tracker] Tracked: ${normalizedUrl} (${title})`);
     }
 
     /**
-     * Try to extract a meaningful title with retries.
-     * X's SPA updates document.title and meta tags asynchronously after navigation,
-     * so we poll a few times before giving up.
+     * Replace a fallback title once the tweet has rendered.
      * @param {string} normalizedUrl
+     * @param {string} title
+     */
+    function updateTitle(normalizedUrl, title) {
+        const entry = visitHistory.get(normalizedUrl);
+        if (!entry || !isMeaningfulTitle(title) || entry.title === title) return;
+        entry.title = title;
+        saveHistory(visitHistory);
+        console.debug(`[X History Tracker] Title: ${title}`);
+    }
+
+    /**
+     * Poll the rendered tweet until its text is available.
+     * @param {string} normalizedUrl
+     * @param {string} statusId
      * @param {number} attempt
      */
-    function extractTitleWithRetry(normalizedUrl, attempt) {
-        const MAX_ATTEMPTS = 6;
-        const RETRY_INTERVAL_MS = 1000;
+    function extractTitleWithRetry(normalizedUrl, statusId, attempt) {
+        const MAX_ATTEMPTS = 8;
+        const RETRY_INTERVAL_MS = 750;
 
-        const title = extractTitle();
-        if (isMeaningfulTitle(title) || attempt >= MAX_ATTEMPTS) {
-            recordVisit(normalizedUrl, title);
+        const title = extractTweetTitle(statusId);
+        if (isMeaningfulTitle(title)) {
+            updateTitle(normalizedUrl, title);
             return;
         }
-        setTimeout(() => extractTitleWithRetry(normalizedUrl, attempt + 1), RETRY_INTERVAL_MS);
+        if (attempt >= MAX_ATTEMPTS) return;
+        setTimeout(() => extractTitleWithRetry(normalizedUrl, statusId, attempt + 1), RETRY_INTERVAL_MS);
     }
 
     /**
      * Check if current URL is a status page and record it.
      */
     function trackCurrentPage() {
-        const url = window.location.href;
-        const match = STATUS_URL_REGEX.exec(url);
-        if (!match) return;
+        const match = STATUS_URL_REGEX.exec(window.location.href);
+        if (!match) {
+            // Leaving a status page means a later return is a new visit.
+            lastTrackedUrl = null;
+            return;
+        }
 
         // Normalize: strip query params and hash
         const normalizedUrl = `https://x.com/${match[1]}/status/${match[2]}`;
-
         if (normalizedUrl === lastTrackedUrl) return;
         lastTrackedUrl = normalizedUrl;
 
-        // Initial delay to let SPA settle, then retry if title is still generic
-        setTimeout(() => extractTitleWithRetry(normalizedUrl, 0), 500);
+        recordVisit(normalizedUrl, '');
+        extractTitleWithRetry(normalizedUrl, match[2], 0);
     }
 
     // --- URL Change Detection ---
@@ -298,37 +354,18 @@
 
     window.addEventListener('popstate', () => trackCurrentPage());
 
-    // --- MutationObserver on <head> for og:title changes ---
-    // X's internal navigation may update the URL and meta tags without
-    // calling pushState/replaceState. Watch for og:title attribute/subtree
-    // mutations to catch these navigations.
-    const headObserver = new MutationObserver(() => {
-        const url = window.location.href;
-        if (!STATUS_URL_REGEX.test(url)) return;
-        const match = STATUS_URL_REGEX.exec(url);
-        const normalizedUrl = `https://x.com/${match[1]}/status/${match[2]}`;
-        if (normalizedUrl === lastTrackedUrl) {
-            // Same URL, but meta may have updated with real content — check title
-            const title = extractTitle();
-            if (isMeaningfulTitle(title)) {
-                const existing = visitHistory.get(normalizedUrl);
-                if (existing && existing.title === normalizedUrl) {
-                    // Title was a fallback URL, now we have real content
-                    existing.title = title;
-                    saveHistory(visitHistory);
-                    console.debug(`[X History Tracker] Updated title: ${normalizedUrl} (${title})`);
-                }
-            }
-            return;
-        }
-        trackCurrentPage();
+    // X may navigate without calling the patched methods. Any DOM change can
+    // hide a URL change, so check the URL after mutations, at most once a frame.
+    let navCheckQueued = false;
+    const bodyObserver = new MutationObserver(() => {
+        if (navCheckQueued) return;
+        navCheckQueued = true;
+        requestAnimationFrame(() => {
+            navCheckQueued = false;
+            trackCurrentPage();
+        });
     });
-    headObserver.observe(document.head, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['content'],
-    });
+    bodyObserver.observe(document.body, { childList: true, subtree: true });
 
     // Initial track on page load
     trackCurrentPage();
@@ -524,16 +561,6 @@
 
         .xht-entry:hover {
             background: rgba(255, 255, 255, 0.03);
-        }
-
-        .xht-entry-score {
-            font-size: 11px;
-            color: #71767b;
-            font-family: "SF Mono", Monaco, Menlo, monospace;
-            min-width: 40px;
-            text-align: right;
-            padding-top: 2px;
-            flex-shrink: 0;
         }
 
         .xht-entry-content {
@@ -823,10 +850,8 @@
         const historyContent = document.createElement('div');
         historyContent.className = 'xht-tab-content active';
 
-        const now = Date.now();
         let entries = Array.from(visitHistory.values())
-            .map(e => ({ ...e, score: frecencyScore(e, now) }))
-            .sort((a, b) => b.score - a.score);
+            .sort((a, b) => b.lastVisit - a.lastVisit);
 
         // Search bar + export button
         const searchContainer = document.createElement('div');
@@ -858,7 +883,7 @@
         // Stats
         const stats = document.createElement('div');
         stats.id = 'xht-stats';
-        stats.textContent = `${entries.length} / ${settings.maxEntries} posts | sorted by frecency`;
+        stats.textContent = `${entries.length} / ${settings.maxEntries} posts | newest first`;
 
         // List
         const list = document.createElement('div');
@@ -877,10 +902,7 @@
             for (const entry of filtered) {
                 const row = document.createElement('div');
                 row.className = 'xht-entry';
-
-                const scoreEl = document.createElement('div');
-                scoreEl.className = 'xht-entry-score';
-                scoreEl.textContent = entry.score.toFixed(1);
+                row.title = entry.title;
 
                 const content = document.createElement('div');
                 content.className = 'xht-entry-content';
@@ -915,15 +937,13 @@
                     saveHistory(visitHistory);
                     entries = entries.filter(x => x.url !== entry.url);
                     row.remove();
-                    const remaining = list.querySelectorAll('.xht-entry').length;
-                    stats.textContent = `${remaining} / ${settings.maxEntries} posts | sorted by frecency`;
+                    stats.textContent = `${entries.length} / ${settings.maxEntries} posts | newest first`;
                 });
 
                 row.addEventListener('click', () => {
                     window.open(entry.url, '_blank');
                 });
 
-                row.appendChild(scoreEl);
                 row.appendChild(content);
                 row.appendChild(deleteBtn);
                 list.appendChild(row);
@@ -936,7 +956,7 @@
             const query = searchInput.value.toLowerCase().trim();
             if (!query) {
                 renderEntries(entries);
-                stats.textContent = `${entries.length} / ${settings.maxEntries} posts | sorted by frecency`;
+                stats.textContent = `${entries.length} / ${settings.maxEntries} posts | newest first`;
                 return;
             }
             const filtered = entries.filter(e =>
@@ -944,7 +964,7 @@
                 e.url.toLowerCase().includes(query)
             );
             renderEntries(filtered);
-            stats.textContent = `${filtered.length} of ${entries.length} / ${settings.maxEntries} posts | sorted by frecency`;
+            stats.textContent = `${filtered.length} of ${entries.length} / ${settings.maxEntries} posts | newest first`;
         });
 
         historyContent.appendChild(searchContainer);
@@ -971,7 +991,7 @@
 
         const maxDesc = document.createElement('div');
         maxDesc.className = 'xht-setting-desc';
-        maxDesc.textContent = 'Maximum number of posts to keep. Lowest frecency entries are evicted when exceeded.';
+        maxDesc.textContent = 'Maximum number of posts to keep. Oldest entries are evicted when exceeded.';
 
         const maxRow = document.createElement('div');
         maxRow.className = 'xht-setting-row';
@@ -1012,44 +1032,6 @@
         maxGroup.appendChild(maxDesc);
         maxGroup.appendChild(maxRow);
 
-        // -- Half-life --
-        const hlGroup = document.createElement('div');
-        hlGroup.className = 'xht-setting-group';
-
-        const hlLabel = document.createElement('div');
-        hlLabel.className = 'xht-setting-label';
-        hlLabel.textContent = 'Frecency half-life (days)';
-
-        const hlDesc = document.createElement('div');
-        hlDesc.className = 'xht-setting-desc';
-        hlDesc.textContent = 'Controls how fast recency decays. Lower = recent visits matter more. Higher = older visits persist longer.';
-
-        const hlRow = document.createElement('div');
-        hlRow.className = 'xht-setting-row';
-
-        const hlRange = document.createElement('input');
-        hlRange.type = 'range';
-        hlRange.className = 'xht-setting-range';
-        hlRange.min = '1';
-        hlRange.max = '30';
-        hlRange.step = '1';
-        hlRange.value = draft.halfLifeDays;
-
-        const hlValue = document.createElement('div');
-        hlValue.className = 'xht-setting-value';
-        hlValue.textContent = `${draft.halfLifeDays}d`;
-
-        hlRange.addEventListener('input', () => {
-            draft.halfLifeDays = parseInt(hlRange.value, 10);
-            hlValue.textContent = `${draft.halfLifeDays}d`;
-        });
-
-        hlRow.appendChild(hlRange);
-        hlRow.appendChild(hlValue);
-        hlGroup.appendChild(hlLabel);
-        hlGroup.appendChild(hlDesc);
-        hlGroup.appendChild(hlRow);
-
         // -- Save button --
         const saveGroup = document.createElement('div');
         saveGroup.className = 'xht-setting-group';
@@ -1066,7 +1048,7 @@
             saveHistory(visitHistory);
             showToast('Settings saved');
             // Update stats on history tab
-            stats.textContent = `${visitHistory.size} / ${settings.maxEntries} posts | sorted by frecency`;
+            stats.textContent = `${visitHistory.size} / ${settings.maxEntries} posts | newest first`;
         });
 
         saveGroup.appendChild(saveBtn);
@@ -1122,7 +1104,7 @@
                 // Refresh entries for history tab
                 entries = [];
                 renderEntries(entries);
-                stats.textContent = `0 / ${settings.maxEntries} posts | sorted by frecency`;
+                stats.textContent = `0 / ${settings.maxEntries} posts | newest first`;
             });
 
             confirmBar.appendChild(confirmMsg);
@@ -1136,7 +1118,6 @@
         dangerZone.appendChild(clearBtn);
 
         settingsInner.appendChild(maxGroup);
-        settingsInner.appendChild(hlGroup);
         settingsInner.appendChild(saveGroup);
         settingsInner.appendChild(divider);
         settingsInner.appendChild(dangerZone);
@@ -1183,10 +1164,8 @@
     GM_registerMenuCommand('View History', showHistoryPanel);
 
     GM_registerMenuCommand('Export History (JSON)', () => {
-        const now = Date.now();
         const entries = Array.from(visitHistory.values())
-            .map(e => ({ ...e, score: frecencyScore(e, now) }))
-            .sort((a, b) => b.score - a.score);
+            .sort((a, b) => b.lastVisit - a.lastVisit);
         const data = JSON.stringify(entries, null, 2);
         const blob = new Blob([data], { type: 'application/json' });
         const url = URL.createObjectURL(blob);

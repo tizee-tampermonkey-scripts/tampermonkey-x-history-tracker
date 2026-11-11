@@ -1,6 +1,6 @@
 # X History Tracker
 
-A Tampermonkey userscript that automatically tracks visited X/Twitter posts with [frecency](https://developer.mozilla.org/en-US/docs/Mozilla/Tech/Places/Frecency_algorithm)-based scoring for easy retrieval.
+A Tampermonkey userscript that automatically tracks visited X/Twitter posts and shows their text in a newest-first list.
 
 ## Problem
 
@@ -8,17 +8,18 @@ Posts you've seen on X but didn't Like or Bookmark are nearly impossible to find
 
 ## Solution
 
-This script silently records every status page you visit, storing the URL and a title summary (from `og:title` meta tag) in `localStorage`. Entries are ranked by **frecency** -- a combination of visit frequency and recency -- so the posts you visit often and recently always float to the top.
+This script records every status page you visit. It reads the rendered tweet from the page, so the stored entry contains the author and tweet text, not just a URL. Entries are sorted by last visit: the post you opened most recently is always at the top.
 
 ## Features
 
-- **Automatic tracking** -- Detects SPA navigation via `pushState`/`replaceState` interception. No manual action required.
-- **Frecency ranking** -- Inspired by [z (jump)](https://github.com/rupa/z) / [autojump](https://github.com/wting/autojump). Each visit credits +1 point; points decay as `2^(-age / half_life)`. Recent + frequent = highest rank.
-- **Deduplication** -- URLs are normalized to `https://x.com/{user}/status/{id}`. Revisits add a recency credit and refresh the title.
-- **Title extraction** -- Reads `<meta property="og:title">` with retry logic (up to 6 attempts, 1s apart) to handle SPA async updates.
-- **Browsable history panel** -- Search/filter by title or URL, sorted by frecency score. Click to open, hover to delete.
-- **Configurable settings** -- Max entries cap and frecency half-life, adjustable via the Settings tab.
-- **Export** -- One-click JSON export of all tracked entries with scores.
+- **Automatic tracking** -- Detects SPA navigation via `pushState`/`replaceState`, `popstate`, and a body mutation observer.
+- **Readable titles** -- Extracts text from the live tweet DOM (`article[data-testid="tweet"]`, `[data-testid="tweetText"]`), with `og:title` as fallback.
+- **Image/video posts** -- Shows `[image]`, `[video]`, or `[link]` when a post has no text.
+- **Newest first** -- Sorted by `lastVisit` descending. No score, no decay, no tuning.
+- **Deduplication** -- URLs are normalized to `https://x.com/{user}/status/{id}`. A revisit moves the post to the top and refreshes its title.
+- **Browsable history panel** -- Search/filter by title or URL. Click to open, hover to delete, hover to see the full title.
+- **Configurable cap** -- Max entries adjustable in the Settings tab. Oldest entries are evicted first.
+- **Export** -- One-click JSON export sorted by last visit.
 - **Danger zone** -- Clear all history with two-step inline confirmation.
 
 ## Install
@@ -29,51 +30,39 @@ This script silently records every status page you visit, storing the URL and a 
 
 ## Usage
 
-### View History
-
 Tampermonkey menu > **View History**
-
-Opens a panel with two tabs:
 
 **History tab**
 - Search bar to filter by title or URL
-- Entries sorted by frecency score (shown on the left)
-- Click an entry to open in a new tab
-- Hover to reveal the delete button
+- Entries sorted by last visit (newest first)
+- Click an entry to open it in a new tab
+- Hover to reveal the delete button; hover the row to see the full title
 - Export button to download as JSON
 
 **Settings tab**
-- **Max entries** -- Slider (50-5000) or manual input (10-5000). Lowest-frecency entries are evicted when exceeded (the post you just visited is never evicted).
-- **Frecency half-life** -- Slider (1-30 days). Lower values make recent visits dominate. Higher values let older entries persist.
+- **Max entries** -- Slider (50-5000) or manual input (10-5000). Oldest entries are evicted when exceeded; the post you just visited is never evicted.
 - **Danger Zone** -- Clear all history with two-step confirmation.
 
 Changes take effect after clicking **Save Settings**.
 
-### Export
+## Title Extraction
 
-Tampermonkey menu > **Export History (JSON)** for quick export without opening the panel.
-
-## How Frecency Works
+X writes `<meta property="og:title">` on full page load but does not reliably update it during SPA navigation. The script therefore reads the rendered tweet:
 
 ```
-on each visit:  score = score * 2^(-age_since_last_visit / half_life) + 1
-displayed rank: score * 2^(-age_since_last_visit / half_life)
+article[data-testid="tweet"]      -> the post
+  [data-testid="User-Name"]       -> display name
+  [data-testid="tweetText"]       -> tweet text (emoji, line breaks preserved)
+  a[href*="/status/"] time        -> matches the status page being viewed
 ```
 
-Only the accumulated score and last-visit timestamp are stored; the decayed value is computed on the fly.
+It retries up to 8 times, 750 ms apart, because the tweet can render after the URL changes. If the tweet never renders, the URL is stored as a fallback. A later visit replaces the fallback with the real text.
 
-| Scenario | half_life=7d | score |
-|---|---|---|
-| Visited once, just now | | 1.0 |
-| Visited once, 7 days ago, untouched since | | 0.5 |
-| Score 10, untouched for 14 days | | 2.5 |
-| Visited once a day for the last 5 days | | ~4.1 |
-
-Posts you visit frequently and recently rank highest. Old, rarely-visited posts naturally sink and get evicted when the cap is reached.
+`og:title` is not used. X leaves that tag stale after SPA navigation, so it can carry the previous page's text.
 
 ## Storage
 
-- **History data** -- `localStorage` key `x-history-tracker` (stays within x.com origin). Stored as compact tuples `[username, statusId, title, score, lastVisitSec]`; the full URL is reconstructed on load. Legacy object format is migrated automatically.
+- **History data** -- `localStorage` key `x-history-tracker` (stays within the x.com origin). Stored as compact tuples `[username, statusId, title, lastVisitSec]`; the full URL is reconstructed on load. Legacy v2 tuples (`[username, statusId, title, score, lastVisitSec]`) and v1 objects load automatically.
 - **Settings** -- `GM_setValue` key `x-history-tracker-settings` (persisted by Tampermonkey)
 
 ## License
